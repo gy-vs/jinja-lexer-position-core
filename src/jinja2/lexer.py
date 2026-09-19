@@ -681,6 +681,7 @@ class Lexer(object):
         source_length = len(source)
         balancing_stack = []
         lstrip_unless_re = self.lstrip_unless_re
+        newlines_stripped = 0
 
         while 1:
             # tokenizer loop
@@ -717,7 +718,12 @@ class Lexer(object):
 
                         if strip_sign == "-":
                             # Strip all whitespace between the text and the tag.
-                            groups = (text.rstrip(),) + groups[1:]
+                            stripped = text.rstrip()
+                            # The stripped newlines were consumed from the
+                            # source, so they have to be counted to keep the
+                            # line number of the following tokens correct.
+                            newlines_stripped = text[len(stripped) :].count("\n")
+                            groups = (stripped,) + groups[1:]
                         elif (
                             # Not marked for preserving whitespace.
                             strip_sign != "+"
@@ -730,7 +736,8 @@ class Lexer(object):
                             l_pos = text.rfind("\n") + 1
 
                             # If there's only whitespace between the newline and the
-                            # tag, strip it.
+                            # tag, strip it. This only strips spaces and tabs after
+                            # the last newline, so no newlines are lost here.
                             if not lstrip_unless_re.search(text, l_pos):
                                 groups = (text[:l_pos],) + groups[1:]
 
@@ -758,7 +765,8 @@ class Lexer(object):
                             data = groups[idx]
                             if data or token not in ignore_if_empty:
                                 yield lineno, token, data
-                            lineno += data.count("\n")
+                            lineno += data.count("\n") + newlines_stripped
+                            newlines_stripped = 0
 
                 # strings as token just are yielded as it.
                 else:

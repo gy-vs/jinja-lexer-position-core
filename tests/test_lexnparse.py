@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
+import sys
+
 import pytest
 
 from jinja2 import Environment
 from jinja2 import nodes
+from jinja2 import StrictUndefined
 from jinja2 import Template
 from jinja2 import TemplateSyntaxError
 from jinja2 import UndefinedError
@@ -818,3 +821,223 @@ ${item} ## the rest of the stuff
 <!--- endfor -->"""
         )
         assert tmpl.render(seq=range(5)) == "01234"
+
+
+class TestLexerLineno(object):
+    """The lexer has to advance the line number by the newlines it
+    consumes from the original source, even when whitespace control
+    (``-``, ``lstrip_blocks``, ``trim_blocks``) strips them from the
+    emitted tokens. Otherwise syntax errors, undefined errors and debug
+    info point at the wrong line, and the offset accumulates when
+    several blocks are stripped in a row. The token values and the
+    rendered output must not change.
+    """
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_minus_strip_keeps_lineno(self, env, newline):
+        source = newline.join(["a", "", "{%- if x %}", "foo", "{% endif %}"])
+        # the two newlines before {%- are stripped from the data token
+        # but still count as source lines 2 and 3
+        assert list(env.lex(source)) == [
+            (1, "data", "a"),
+            (3, "block_begin", "{%-"),
+            (3, "whitespace", " "),
+            (3, "name", "if"),
+            (3, "whitespace", " "),
+            (3, "name", "x"),
+            (3, "whitespace", " "),
+            (3, "block_end", "%}"),
+            (3, "data", "\nfoo\n"),
+            (5, "block_begin", "{%"),
+            (5, "whitespace", " "),
+            (5, "name", "endif"),
+            (5, "whitespace", " "),
+            (5, "block_end", "%}"),
+        ]
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_variable_minus_strip_keeps_lineno(self, env, newline):
+        source = newline.join(["a", "", "{{- x }}", "b"])
+        assert list(env.lex(source)) == [
+            (1, "data", "a"),
+            (3, "variable_begin", "{{-"),
+            (3, "whitespace", " "),
+            (3, "name", "x"),
+            (3, "whitespace", " "),
+            (3, "variable_end", "}}"),
+            (3, "data", "\nb"),
+        ]
+
+    def test_consecutive_strip_does_not_accumulate(self, env):
+        source = (
+            "{%- if a %}\n\n\n{%- endif %}\n"
+            "{%- if b %}\n\n\n{%- endif %}\ndone"
+        )
+        tokens = [t for t in env.lex(source) if t[1] != "whitespace"]
+        assert tokens == [
+            (1, "block_begin", "{%-"),
+            (1, "name", "if"),
+            (1, "name", "a"),
+            (1, "block_end", "%}"),
+            (4, "block_begin", "{%-"),
+            (4, "name", "endif"),
+            (4, "block_end", "%}"),
+            (5, "block_begin", "{%-"),
+            (5, "name", "if"),
+            (5, "name", "b"),
+            (5, "block_end", "%}"),
+            (8, "block_begin", "{%-"),
+            (8, "name", "endif"),
+            (8, "block_end", "%}"),
+            (8, "data", "\ndone"),
+        ]
+
+    def test_comment_strip_keeps_lineno(self, env):
+        assert list(env.lex("a\n\n{#- c #}\nb")) == [
+            (1, "data", "a"),
+            (3, "comment_begin", "{#-"),
+            (3, "comment", " c "),
+            (3, "comment_end", "#}"),
+            (3, "data", "\nb"),
+        ]
+
+    def test_raw_strip_keeps_lineno(self, env):
+        # {%- raw strips the newlines before the tag, {%- endraw strips
+        # the trailing newlines of the raw body; both still count.
+        assert list(env.lex("a\n\n{%- raw %}x\n\n{%- endraw %}\nb")) == [
+            (1, "data", "a"),
+            (3, "raw_begin", "{%- raw %}"),
+            (3, "data", "x"),
+            (5, "raw_end", "{%- endraw %}"),
+            (5, "data", "\nb"),
+        ]
+
+    def test_block_end_strip_keeps_lineno(self, env):
+        # the newlines consumed by -%} are part of the block_end value
+        assert list(env.lex("a\n{% if x -%}\n\n\nb\n{% endif %}")) == [
+            (1, "data", "a\n"),
+            (2, "block_begin", "{%"),
+            (2, "whitespace", " "),
+            (2, "name", "if"),
+            (2, "whitespace", " "),
+            (2, "name", "x"),
+            (2, "whitespace", " "),
+            (2, "block_end", "-%}\n\n\n"),
+            (5, "data", "b\n"),
+            (6, "block_begin", "{%"),
+            (6, "whitespace", " "),
+            (6, "name", "endif"),
+            (6, "whitespace", " "),
+            (6, "block_end", "%}"),
+        ]
+
+    def test_trim_blocks_keeps_lineno(self):
+        env = Environment(trim_blocks=True)
+        # the newline consumed by trim_blocks is part of the block_end
+        # value and keeps counting towards the line number
+        assert list(env.lex("a\n{% if x %}\nb\n{% endif %}")) == [
+            (1, "data", "a\n"),
+            (2, "block_begin", "{%"),
+            (2, "whitespace", " "),
+            (2, "name", "if"),
+            (2, "whitespace", " "),
+            (2, "name", "x"),
+            (2, "whitespace", " "),
+            (2, "block_end", "%}\n"),
+            (3, "data", "b\n"),
+            (4, "block_begin", "{%"),
+            (4, "whitespace", " "),
+            (4, "name", "endif"),
+            (4, "whitespace", " "),
+            (4, "block_end", "%}"),
+        ]
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_lstrip_blocks_keeps_lineno(self, newline):
+        env = Environment(lstrip_blocks=True, trim_blocks=True)
+        source = newline.join(["a", "   {% if x %}", "b", "{% endif %}"])
+        assert list(env.lex(source)) == [
+            (1, "data", "a\n"),
+            (2, "block_begin", "{%"),
+            (2, "whitespace", " "),
+            (2, "name", "if"),
+            (2, "whitespace", " "),
+            (2, "name", "x"),
+            (2, "whitespace", " "),
+            (2, "block_end", "%}\n"),
+            (3, "data", "b\n"),
+            (4, "block_begin", "{%"),
+            (4, "whitespace", " "),
+            (4, "name", "endif"),
+            (4, "whitespace", " "),
+            (4, "block_end", "%}"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("source", "lineno"),
+        [
+            # stripped newlines before the block still count
+            ("a\nb\nc\n{%- if x %}\n{{ 1 + }}\n{% endif %}", 5),
+            # same with CRLF line endings
+            ("a\r\nb\r\nc\r\n{%- if x %}\r\n{{ 1 + }}\r\n{% endif %}", 5),
+            # the offset must not accumulate over several stripped blocks
+            (
+                "{%- if a %}\n\n\n{%- endif %}\n"
+                "{%- if b %}\n\n\n{%- endif %}\n{{ 1 + }}",
+                9,
+            ),
+            # comments strip through the same rule
+            ("a\n\n{#- comment #}\n{{ 1 + }}", 4),
+            # raw strips on both ends
+            ("a\n\n{%- raw %}x\n\n{%- endraw %}\n{{ 1 + }}", 6),
+            # variable tags strip through the same rule
+            ("a\n\n{{- x }}\n{{ 1 + }}", 4),
+        ],
+    )
+    def test_syntax_error_lineno(self, env, source, lineno):
+        with pytest.raises(TemplateSyntaxError) as excinfo:
+            env.from_string(source)
+        assert excinfo.value.lineno == lineno
+
+    def test_syntax_error_lineno_trim_blocks(self):
+        env = Environment(trim_blocks=True)
+        with pytest.raises(TemplateSyntaxError) as excinfo:
+            env.from_string("a\n{% if x %}\n{{ 1 + }}\n{% endif %}")
+        assert excinfo.value.lineno == 3
+
+    def test_syntax_error_lineno_lstrip_blocks(self):
+        env = Environment(lstrip_blocks=True, trim_blocks=True)
+        with pytest.raises(TemplateSyntaxError) as excinfo:
+            env.from_string("a\nb\n   {% if x %}\n{{ 1 + }}\n{% endif %}")
+        assert excinfo.value.lineno == 4
+
+    def test_runtime_error_lineno(self):
+        env = Environment(undefined=StrictUndefined)
+        tmpl = env.from_string("a\n\n\n{%- if true %}\n{{ undefined_var }}\n{% endif %}")
+        try:
+            tmpl.render()
+            pytest.fail("expected UndefinedError")
+        except UndefinedError:
+            tb = sys.exc_info()[2]
+        template_linenos = []
+        while tb is not None:
+            if tb.tb_frame.f_code.co_filename == "<template>":
+                template_linenos.append(tb.tb_lineno)
+            tb = tb.tb_next
+        assert template_linenos == [5]
+
+    def test_stripped_output_unchanged(self, env):
+        # whitespace control strips exactly the same output as before,
+        # only the reported line numbers changed
+        tmpl = env.from_string("a\n\n{%- if x %}\nfoo\n{% endif %}")
+        assert tmpl.render(x=True) == "a\nfoo\n"
+        tmpl = env.from_string("a\n\n{#- c #}\nb")
+        assert tmpl.render() == "a\nb"
+        tmpl = env.from_string("a\n\n{%- raw %}x\n\n{%- endraw %}\nb")
+        assert tmpl.render() == "ax\nb"
+        tmpl = env.from_string(
+            "{%- if a %}\n\n\n{%- endif %}\n{%- if b %}\n\n\n{%- endif %}\ndone"
+        )
+        assert tmpl.render(a=True, b=True) == "\ndone"
+        tmpl = env.from_string("a\n{% if x -%}\n\n\nb\n{% endif %}")
+        assert tmpl.render(x=True) == "a\nb\n"
