@@ -705,6 +705,15 @@ class Lexer(object):
                 if isinstance(tokens, tuple):
                     groups = m.groups()
 
+                    # Line numbers always advance by the newlines that were
+                    # actually consumed from the source, not by the newlines
+                    # remaining in the emitted token value.  Whitespace
+                    # control (lstrip / the ``-`` and ``+`` signs) may rewrite
+                    # ``groups`` below and remove newlines from a value even
+                    # though ``m.end()`` has already consumed them, so the
+                    # original groups are kept for line counting.
+                    original_groups = groups
+
                     if isinstance(tokens, OptionalLStrip):
                         # Rule supports lstrip. Match will look like
                         # text, block type, whitespace control, type, control, ...
@@ -758,7 +767,7 @@ class Lexer(object):
                             data = groups[idx]
                             if data or token not in ignore_if_empty:
                                 yield lineno, token, data
-                            lineno += data.count("\n")
+                            lineno += original_groups[idx].count("\n")
 
                 # strings as token just are yielded as it.
                 else:

@@ -21,6 +21,13 @@ Unreleased
     when using Pytest. Due to the difficulty in supporting Python 2 and
     :pep:`451` simultaneously, the changes are reverted until 3.0.
     :pr:`1182`
+-   The lexer advances token line numbers by the newlines actually
+    consumed from the source instead of the newlines left in the
+    emitted token value. This fixes incorrect error and traceback line
+    numbers (which accumulated over multiple tags) when whitespace was
+    removed by ``lstrip_blocks``, ``trim_blocks`` or the ``-``
+    whitespace control, including inside comments and ``raw`` blocks.
+    Token values and rendered output are unchanged.
 
 
 Version 2.11.1

@@ -12,7 +12,9 @@ from jinja2._compat import text_type
 from jinja2.lexer import Token
 from jinja2.lexer import TOKEN_BLOCK_BEGIN
 from jinja2.lexer import TOKEN_BLOCK_END
+from jinja2.lexer import TOKEN_DATA
 from jinja2.lexer import TOKEN_EOF
+from jinja2.lexer import TOKEN_NAME
 from jinja2.lexer import TokenStream
 
 
@@ -818,3 +820,235 @@ ${item} ## the rest of the stuff
 <!--- endfor -->"""
         )
         assert tmpl.render(seq=range(5)) == "01234"
+
+
+class TestWhitespaceControlLineNumbers(object):
+    # Whitespace stripping removes text from emitted TOKEN_DATA values, but
+    # it must not remove the consumed newlines from the lexer's line count.
+    # Every case is exercised with both LF and CRLF input; tokeniter
+    # normalizes line endings, so the resulting token streams must match.
+
+    @staticmethod
+    def _tokenize(env, source):
+        # Drop the eof token, keep (lineno, type, value).
+        stream = env.lexer.tokenize(source)
+        return [
+            (token.lineno, token.type, token.value)
+            for token in stream
+            if token.type is not TOKEN_EOF
+        ]
+
+    @staticmethod
+    def _line_count(source):
+        return len(source.replace("\r\n", "\n").split("\n"))
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_minus_strip_lineno(self, newline):
+        env = Environment()
+        source = "a" + newline * 3 + "{%- if x %}hi{% endif %}"
+        tokens = self._tokenize(env, source)
+        # The tag sits on original line 4 even though the three preceding
+        # newlines were stripped out of the data token.
+        assert tokens[0] == (1, TOKEN_DATA, "a")
+        assert tokens[1] == (4, TOKEN_BLOCK_BEGIN, "{%-")
+        assert (4, TOKEN_NAME, "if") in tokens
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_consecutive_strips_accumulate(self, newline):
+        env = Environment()
+        source = (
+            "a" + newline
+            + "{%- if x -%}" + newline
+            + "b" + newline
+            + "{%- endif -%}" + newline
+            + "c"
+        )
+        tokens = self._tokenize(env, source)
+        # Block end strips the newline after the tag; the following data
+        # must therefore start on the next original line.
+        assert (3, TOKEN_DATA, "b") in tokens
+        assert (5, TOKEN_DATA, "c") in tokens
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_trim_blocks_lineno(self, newline):
+        env = Environment(trim_blocks=True)
+        source = (
+            "a" + newline
+            + "{% if True %}" + newline
+            + "b" + newline
+            + "{% endif %}" + newline
+            + "c"
+        )
+        tokens = self._tokenize(env, source)
+        # trim_blocks keeps the consumed newline in the block_end value, so
+        # line counting must work exactly as without trimming. Data values
+        # have their newlines normalized to "\n".
+        assert (3, TOKEN_DATA, "b\n") in tokens
+        assert (5, TOKEN_DATA, "c") in tokens
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_lstrip_blocks_lineno(self, newline):
+        env = Environment(lstrip_blocks=True, trim_blocks=False)
+        source = "a" + newline + "b" + newline + "    {% if x %}hi{% endif %}"
+        tokens = self._tokenize(env, source)
+        # Only spaces/tabs after the last newline are stripped; the newline
+        # itself stays in the data token.
+        assert tokens[0] == (1, TOKEN_DATA, "a\nb\n")
+        assert tokens[1] == (3, TOKEN_BLOCK_BEGIN, "{%")
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_comment_strip_lineno(self, newline):
+        env = Environment()
+        source = "{# foo" + newline + "bar -#}" + newline * 2 + "baz"
+        tokens = self._tokenize(env, source)
+        # Comment tokens are ignored by wrap. The "-" before the comment end
+        # strips the two newlines after the comment, but they were still
+        # consumed from the source, so "baz" is on original line 4.
+        assert tokens == [(4, TOKEN_DATA, "baz")]
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_lstrip_comment_lineno(self, newline):
+        env = Environment(lstrip_blocks=True)
+        source = "    {# c #}" + newline + "hello" + newline + "    {# d #}"
+        tokens = self._tokenize(env, source)
+        # The lexer normalizes newlines in TOKEN_DATA to "\n".
+        assert tokens == [(1, TOKEN_DATA, "\nhello\n")]
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_raw_block_lineno(self, newline):
+        env = Environment()
+        source = (
+            "{% raw -%}" + newline
+            + "x" + newline
+            + "y" + newline
+            + "{%- endraw %}" + newline
+            + "z"
+        )
+        tokens = self._tokenize(env, source)
+        assert tokens == [
+            # Inner raw data keeps its newlines (normalized to "\n") and
+            # starts on line 2.
+            (2, TOKEN_DATA, "x\ny"),
+            # The newline before endraw was stripped from the data, but it
+            # was still consumed from the source: the following text stays
+            # on its original line 4.
+            (4, TOKEN_DATA, "\nz"),
+        ]
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_token_stream_content_unchanged_by_fix(self, newline):
+        # The fix may only correct linenos; token types and values must be
+        # identical to the count-by-value behavior for the emitted text.
+        sources_and_envs = [
+            ("a" + newline * 3 + "{%- if x %}hi{% endif %}", Environment()),
+            (
+                "a" + newline + "{%- if x -%}" + newline + "b"
+                + newline + "{%- endif -%}" + newline + "c",
+                Environment(),
+            ),
+            (
+                "a" + newline + "{% if True %}" + newline + "b"
+                + newline + "{% endif %}" + newline + "c",
+                Environment(trim_blocks=True),
+            ),
+            (
+                "a" + newline + "b" + newline + "    {% if x %}hi{% endif %}",
+                Environment(lstrip_blocks=True),
+            ),
+            ("{# foo" + newline + "bar -#}" + newline * 2 + "baz", Environment()),
+            (
+                "{% raw -%}" + newline + "x" + newline + "y" + newline
+                + "{%- endraw %}" + newline + "z",
+                Environment(),
+            ),
+        ]
+        for source, env in sources_and_envs:
+            tokens = self._tokenize(env, source)
+            # Every line number must point at a line that actually exists in
+            # the original source.
+            line_count = self._line_count(source)
+            assert all(1 <= lineno <= line_count for lineno, _, _ in tokens)
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_syntax_error_after_minus_strip(self, newline):
+        env = Environment()
+        source = "a" + newline * 3 + "{%- if %}"
+        with pytest.raises(TemplateSyntaxError) as exc_info:
+            env.from_string(source)
+        assert exc_info.value.lineno == 4
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_syntax_error_after_lstrip(self, newline):
+        env = Environment(lstrip_blocks=True, trim_blocks=False)
+        source = (
+            "line1" + newline + "line2" + newline + "    {% if %}"
+        )
+        with pytest.raises(TemplateSyntaxError) as exc_info:
+            env.from_string(source)
+        assert exc_info.value.lineno == 3
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_syntax_error_after_accumulated_strips(self, newline):
+        env = Environment()
+        source = (
+            "a" + newline
+            + "{%- if x %}" + newline
+            + "b" + newline
+            + "{%- endif %}" + newline
+            + "c" + newline
+            + "{{ 1 + }}"
+        )
+        with pytest.raises(TemplateSyntaxError) as exc_info:
+            env.from_string(source)
+        # Two block-leading strips plus two block-trailing trims consume two
+        # extra newlines; the error is on the last original line.
+        assert exc_info.value.lineno == 6
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_syntax_error_after_comment_strip(self, newline):
+        env = Environment()
+        source = (
+            "{# foo" + newline + "bar -#}" + newline * 2
+            + "baz" + newline + "{{ 1 + }}"
+        )
+        with pytest.raises(TemplateSyntaxError) as exc_info:
+            env.from_string(source)
+        assert exc_info.value.lineno == 5
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_syntax_error_after_raw_block(self, newline):
+        env = Environment()
+        source = (
+            "{% raw %}" + newline + "ignore" + newline + "me" + newline
+            + "{% endraw %}" + newline + "{{ 1 + }}"
+        )
+        with pytest.raises(TemplateSyntaxError) as exc_info:
+            env.from_string(source)
+        assert exc_info.value.lineno == 5
+
+    @pytest.mark.parametrize("newline", ("\n", "\r\n"))
+    def test_undefined_error_after_accumulated_strips(self, newline):
+        import re
+        from traceback import format_exception
+
+        env = Environment()
+        source = (
+            "a" + newline
+            + "{%- if x -%}" + newline
+            + "b" + newline
+            + "{%- endif -%}" + newline
+            + "c" + newline
+            + "{{ oops.bar }}"
+        )
+        template = env.from_string(source)
+        with pytest.raises(UndefinedError) as exc_info:
+            template.render()
+        tb = "".join(
+            format_exception(
+                exc_info.type, exc_info.value, exc_info.tb
+            )
+        )
+        match = re.search(r'File "<template>", line (\d+)', tb)
+        assert match is not None
+        assert int(match.group(1)) == 6
+
